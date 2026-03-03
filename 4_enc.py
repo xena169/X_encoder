@@ -1,6 +1,7 @@
 ﻿import argparse
 import csv
 import math
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -9,8 +10,8 @@ import matplotlib.pyplot as plt
 
 MARKER = bytes.fromhex("FAF320")
 ROW_LEN = 138
-FRAME_COL_INDEX = 13  # 14th column (N)
-VALUE_COL_INDEX = 23  # 24th column (X)
+FRAME_COL_INDEX = 3  # c004 in marker-aligned test rows
+VALUE_COL_INDEX = 10  # c011 in marker-aligned test rows
 DEFAULT_INPUT_DIR = Path("input")
 
 PAIR_DEFINITIONS = {
@@ -41,6 +42,24 @@ def split_records(binary: bytes) -> list[bytes]:
     return records
 
 
+def split_records_with_marker(binary: bytes) -> list[bytes]:
+    marker_positions = []
+    start = 0
+    while True:
+        idx = binary.find(MARKER, start)
+        if idx == -1:
+            break
+        marker_positions.append(idx)
+        start = idx + 1
+
+    records = []
+    for i, marker_pos in enumerate(marker_positions):
+        rec_start = marker_pos
+        rec_end = marker_positions[i + 1] if i + 1 < len(marker_positions) else len(binary)
+        records.append(binary[rec_start:rec_end])
+    return records
+
+
 def records_to_rows(records: list[bytes]) -> list[list[int | None]]:
     rows = []
     for rec in records:
@@ -49,6 +68,19 @@ def records_to_rows(records: list[bytes]) -> list[list[int | None]]:
             row[i] = b
         rows.append(row)
     return rows
+
+
+def write_test_rows_csv(rows: list[list[int | None]], output_csv: Path) -> None:
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["row"] + [f"c{i:03d}" for i in range(1, ROW_LEN + 1)]
+    with output_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for idx, row in enumerate(rows, start=1):
+            out = {"row": idx}
+            for col_i, v in enumerate(row, start=1):
+                out[f"c{col_i:03d}"] = "" if v is None else f"{v:02X}"
+            writer.writerow(out)
 
 
 def get_frame_id(row: list[int | None]) -> int | None:
@@ -201,20 +233,26 @@ def parse_args() -> argparse.Namespace:
         description="Extract encX/encY/encZ from binary log and output CSV/plots."
     )
     parser.add_argument(
-        "input_file",
-        nargs="?",
+        "input_files",
+        nargs="*",
         type=Path,
-        default=None,
-        help="Input .bin/.qltlm file. If omitted, auto-detect from --input-dir.",
+        default=[],
+        help="Input .bin/.qltlm file(s). If omitted, auto-detect from --input-dir.",
     )
     parser.add_argument(
         "--input-dir",
         type=Path,
         default=DEFAULT_INPUT_DIR,
-        help="Directory scanned when input_file is omitted (default: input)",
+        help="Directory scanned when input_files are omitted (default: input)",
     )
     parser.add_argument("-o", "--output-csv", type=Path, default=Path("output/encoder_values.csv"))
     parser.add_argument("--plot-dir", type=Path, default=Path("output/plots"))
+    parser.add_argument(
+        "--test-csv",
+        type=Path,
+        default=Path("output/test_rows.csv"),
+        help="Test CSV path for marker-aligned rows (default: output/test_rows.csv)",
+    )
     parser.add_argument(
         "--x-unit",
         choices=["sec", "min"],
@@ -231,9 +269,9 @@ def ask_x_unit() -> str:
         print("Please input 'sec' or 'min'.")
 
 
-def resolve_input_file(input_file: Path | None, input_dir: Path) -> Path:
-    if input_file is not None:
-        return input_file
+def resolve_input_files(input_files: list[Path], input_dir: Path) -> list[Path]:
+    if input_files:
+        return input_files
 
     if not input_dir.exists() or not input_dir.is_dir():
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
@@ -241,42 +279,90 @@ def resolve_input_file(input_file: Path | None, input_dir: Path) -> Path:
     candidates = sorted(list(input_dir.glob("*.bin")) + list(input_dir.glob("*.qltlm")))
     if not candidates:
         raise FileNotFoundError(f"No .bin/.qltlm found in {input_dir}")
-    if len(candidates) > 1:
-        raise RuntimeError(
-            "Multiple input files found. Specify one explicitly, e.g. "
-            "python 4_enc.py input/sample.bin"
-        )
-    return candidates[0]
+    return candidates
 
 
-def main() -> None:
-    args = parse_args()
-    input_file = resolve_input_file(args.input_file, args.input_dir)
+def csv_path_for_file(
+    base_output_csv: Path, input_file: Path, multiple_inputs: bool, output_csv_specified: bool
+) -> Path:
+    if not multiple_inputs:
+        return base_output_csv
+    if output_csv_specified and base_output_csv.suffix.lower() != ".csv":
+        return base_output_csv / f"{input_file.stem}.csv"
+    if output_csv_specified and base_output_csv.suffix.lower() == ".csv":
+        return base_output_csv.parent / f"{base_output_csv.stem}_{input_file.stem}.csv"
+    return Path("output") / f"{input_file.stem}.csv"
 
-    if not input_file.exists():
-        raise FileNotFoundError(f"Input file not found: {input_file}")
 
-    if input_file.suffix.lower() not in {".bin", ".qltlm"}:
-        print("Warning: extension is not .bin/.qltlm, but processing continues.")
+def plot_dir_for_file(
+    base_plot_dir: Path, input_file: Path, multiple_inputs: bool, plot_dir_specified: bool
+) -> Path:
+    if not multiple_inputs:
+        return base_plot_dir
+    if plot_dir_specified:
+        return base_plot_dir / input_file.stem
+    return Path("output/plots") / input_file.stem
 
-    x_unit = args.x_unit if args.x_unit else ask_x_unit()
 
+def test_csv_path_for_file(base_test_csv: Path, input_file: Path, multiple_inputs: bool) -> Path:
+    if not multiple_inputs:
+        return base_test_csv
+    if base_test_csv.suffix.lower() == ".csv":
+        return base_test_csv.parent / f"{base_test_csv.stem}_{input_file.stem}.csv"
+    return base_test_csv / f"{input_file.stem}.csv"
+
+
+def process_one_file(
+    input_file: Path, x_unit: str, output_csv: Path, plot_dir: Path, test_csv: Path
+) -> tuple[int, int, int]:
     binary = input_file.read_bytes()
-    records = split_records(binary)
+
+    # Test dump: split right before marker so each row starts with FA F3 20.
+    test_records = split_records_with_marker(binary)
+    test_rows = records_to_rows(test_records)
+    write_test_rows_csv(test_rows, test_csv)
+
+    records = split_records_with_marker(binary)
     rows = records_to_rows(records)
     windows = extract_time_windows(rows)
     output_rows = build_output_rows(windows)
 
-    write_csv(output_rows, args.output_csv)
-    plot_axis(output_rows, x_unit=x_unit, plot_dir=args.plot_dir)
+    write_csv(output_rows, output_csv)
+    plot_axis(output_rows, x_unit=x_unit, plot_dir=plot_dir)
+    return len(records), len(windows), len(output_rows)
 
-    print(f"Input: {input_file}")
-    print(f"records: {len(records)}")
-    print(f"time windows: {len(windows)}")
-    print(f"csv rows: {len(output_rows)}")
-    print(f"CSV: {args.output_csv}")
-    print(f"Plots: {args.plot_dir}")
+
+def main() -> None:
+    args = parse_args()
+    output_csv_specified = any(a in {"-o", "--output-csv"} for a in sys.argv[1:])
+    plot_dir_specified = any(a == "--plot-dir" for a in sys.argv[1:])
+    input_files = resolve_input_files(args.input_files, args.input_dir)
+    multiple_inputs = len(input_files) > 1
+
+    x_unit = args.x_unit if args.x_unit else ask_x_unit()
+
+    for input_file in input_files:
+        if not input_file.exists():
+            raise FileNotFoundError(f"Input file not found: {input_file}")
+
+        if input_file.suffix.lower() not in {".bin", ".qltlm"}:
+            print(f"Warning: extension is not .bin/.qltlm, but processing continues: {input_file}")
+
+        output_csv = csv_path_for_file(args.output_csv, input_file, multiple_inputs, output_csv_specified)
+        plot_dir = plot_dir_for_file(args.plot_dir, input_file, multiple_inputs, plot_dir_specified)
+        test_csv = test_csv_path_for_file(args.test_csv, input_file, multiple_inputs)
+        rec_n, win_n, row_n = process_one_file(input_file, x_unit, output_csv, plot_dir, test_csv)
+
+        print(f"Input: {input_file}")
+        print(f"records: {rec_n}")
+        print(f"time windows: {win_n}")
+        print(f"csv rows: {row_n}")
+        print(f"CSV: {output_csv}")
+        print(f"Plots: {plot_dir}")
+        print(f"Test CSV: {test_csv}")
 
 
 if __name__ == "__main__":
     main()
+
+
